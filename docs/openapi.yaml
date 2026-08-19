@@ -1,0 +1,245 @@
+openapi: 3.1.0
+info:
+  title: API Gateway
+  version: '1.0'
+  description: |
+    Distributed microservices API gateway with saga orchestration, multi-partner schema
+    validation, hybrid audit logging, and out-of-band anomaly detection.
+
+    All endpoints require a `Bearer` JWT in the `Authorization` header. The JWT must
+    carry a `partner` claim matching the URL's `{partner}` segment.
+
+    Idempotent operations accept an `Idempotency-Key` header. Replays within the
+    24-hour TTL return the cached 2xx response with an `X-Idempotency-Replay: true`
+    response header.
+  contact:
+    name: API Gateway Team
+servers:
+  - url: https://api.gateway.example.com/v1
+    description: Production
+  - url: http://localhost:5000/v1
+    description: Local development
+security:
+  - BearerAuth: []
+paths:
+  /{partner}/{route}:
+    parameters:
+      - $ref: '#/components/parameters/PartnerName'
+      - $ref: '#/components/parameters/Route'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/SchemaVersion'
+    post:
+      summary: Forward request to partner upstream
+      description: |
+        Validates the request body against the partner's effective JSON schema,
+        routes through the saga pipeline (transform → call upstream → aggregate),
+        and returns the aggregated response.
+
+        On saga failure, returns 502 with the failure reason. Compensation
+        handlers run automatically for any committed upstream side effects.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              description: The request body — validated against the partner's SchemaVersion.
+      responses:
+        '200':
+          description: Success
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationId'
+            X-Idempotency-Replay:
+              $ref: '#/components/headers/IdempotencyReplay'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    description: Aggregated upstream response payload
+                  correlationId:
+                    type: string
+                    format: uuid
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          $ref: '#/components/responses/SagaFailure'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    get:
+      summary: Forward GET to partner upstream
+      responses:
+        '200':
+          description: Success
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      summary: Forward PUT to partner upstream
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Success
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    patch:
+      summary: Forward PATCH to partner upstream
+      responses:
+        '200':
+          description: Success
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    delete:
+      summary: Forward DELETE to partner upstream
+      responses:
+        '200':
+          description: Success
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    PartnerName:
+      name: partner
+      in: path
+      required: true
+      description: Registered partner name
+      schema:
+        type: string
+        minLength: 1
+    Route:
+      name: route
+      in: path
+      required: true
+      description: Opaque path segment(s) forwarded to the upstream
+      schema:
+        type: string
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: Client-supplied correlation id. Echoed back in the response.
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Client-supplied idempotency key. A replayed POST with the same key and the
+        same request body hash returns the cached 2xx response within the 24-hour TTL.
+        A replayed POST with the same key but a different request body hash is rejected
+        (idempotency violation).
+      schema:
+        type: string
+        maxLength: 200
+    SchemaVersion:
+      name: X-Schema-Version
+      in: header
+      required: false
+      description: |
+        Partner-declared schema version. If omitted, the gateway uses the latest
+        EffectiveDate <= now. If specified but not registered for the partner,
+        schema validation fails with 422.
+      schema:
+        type: string
+        maxLength: 20
+  headers:
+    CorrelationId:
+      description: Echoes the request correlation id (or a generated one if the request didn't supply it).
+      schema:
+        type: string
+        format: uuid
+    IdempotencyReplay:
+      description: Set to "true" when the response is served from the idempotency cache.
+      schema:
+        type: string
+        enum: ['true']
+  responses:
+    Unauthorized:
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    NotFound:
+      description: Partner not registered
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ValidationError:
+      description: Request body failed JSON schema validation
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/ProblemDetails'
+              - type: object
+                properties:
+                  schemaVersion:
+                    type: string
+    RateLimited:
+      description: Partner rate limit exceeded
+      headers:
+        Retry-After:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    SagaFailure:
+      description: Saga step failed; compensation handlers invoked
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ServiceUnavailable:
+      description: No schema registered for the partner, or database unavailable
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+  schemas:
+    ProblemDetails:
+      type: object
+      description: RFC 7807 Problem Details
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+      required:
+        - type
+        - title
+        - status
