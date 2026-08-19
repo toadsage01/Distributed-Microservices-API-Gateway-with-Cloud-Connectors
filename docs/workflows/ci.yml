@@ -1,0 +1,130 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  checks: write
+
+env:
+  DOTNET_NOLOGO: '1'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_GENERATE_ASPNET_CERT: '0'
+
+jobs:
+  build-and-test:
+    name: Build, format, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+          dotnet-quality: 'ga'
+
+      - name: Restore
+        run: dotnet restore ApiGateway.sln
+
+      - name: Format check
+        run: dotnet format ApiGateway.sln --verify-no-changes --severity warn
+
+      - name: Build
+        run: dotnet build ApiGateway.sln --configuration Release --no-restore
+
+      - name: Unit tests
+        run: dotnet test tests/ApiGateway.UnitTests/ApiGateway.UnitTests.csproj --configuration Release --no-build --collect:"XPlat Code Coverage" --logger "trx;LogFileName=unit-tests.trx"
+
+      - name: Integration tests (Testcontainers)
+        run: dotnet test tests/ApiGateway.IntegrationTests/ApiGateway.IntegrationTests.csproj --configuration Release --no-build --collect:"XPlat Code Coverage" --logger "trx;LogFileName=integration-tests.trx"
+        env:
+          # Testcontainers needs Docker socket access — the GitHub runner
+          # has Docker pre-installed. No secrets needed because the
+          # container isephemeral.
+          TESTCONTAINERS_RYUK_DISABLED: 'true'
+
+      - name: Generate static OpenAPI spec
+        run: |
+          mkdir -p artifacts
+          dotnet tool install --global Swashbuckle.AspNetCore.Cli --version 6.7.3
+          dotnet run --project src/ApiGateway.Api/ApiGateway.Api.csproj --configuration Release --no-build -- --urls http://localhost:5099 &
+          API_PID=$!
+          sleep 8
+          ~/.dotnet/tools/swagger tofile --output artifacts/openapi.yaml http://localhost:5099/swagger/v1/swagger.json v1 || true
+          # Fallback: pull the swagger.json from the running instance
+          curl -sf http://localhost:5099/swagger/v1/swagger.json -o artifacts/openapi.json || true
+          kill $API_PID 2>/dev/null || true
+
+      - name: Publish coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            **/coverage.cobertura.xml
+            **/coverage.opencover.xml
+
+      - name: Publish test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            **/*.trx
+
+      - name: Publish OpenAPI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-spec
+          path: artifacts/openapi.*
+
+      - name: Publish API binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-binaries
+          path: src/ApiGateway.Api/bin/Release/net8.0/publish/
+
+  terraform-plan:
+    name: Terraform plan
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.x'
+
+      - name: Terraform format check
+        working-directory: infra/terraform
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        working-directory: infra/terraform
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        working-directory: infra/terraform
+        run: terraform validate
+
+      - name: Terraform plan
+        working-directory: infra/terraform
+        run: terraform plan -input=false -out=tfplan
+        env:
+          # Use stub values — the plan only needs to validate the
+          # configuration is structurally sound, not deploy to real AWS.
+          TF_VAR_jwt_signing_key: 'stub-key-for-plan-only-min-32-characters-long'
+          TF_VAR_sql_server_admin_password: 'StubPassword123!'

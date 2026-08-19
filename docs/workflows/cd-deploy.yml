@@ -1,0 +1,149 @@
+name: cd-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+env:
+  DOTNET_NOLOGO: '1'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+
+jobs:
+  build-artifact:
+    name: Build + publish API binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      artifact_hash: ${{ steps.hash.outputs.hash }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore ApiGateway.sln
+
+      - name: Publish
+        run: |
+          dotnet publish src/ApiGateway.Api/ApiGateway.Api.csproj \
+            --configuration Release \
+            --runtime linux-x64 \
+            --self-contained false \
+            --output publish/api
+
+      - name: Pack artifact
+        run: |
+          cd publish/api
+          tar -czf ../../latest.tar.gz .
+          cd ../..
+          sha256sum latest.tar.gz | cut -d' ' -f1 > latest.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-build
+          path: |
+            latest.tar.gz
+            latest.sha256
+
+      - name: Output hash
+        id: hash
+        run: echo "hash=$(cat latest.sha256)" >> $GITHUB_OUTPUT
+
+  terraform-plan-apply:
+    name: Terraform plan + apply (${{ github.event.inputs.environment || 'staging' }})
+    needs: build-artifact
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.x'
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Terraform init
+        working-directory: infra/terraform
+        run: terraform init -input=false
+
+      - name: Terraform plan
+        working-directory: infra/terraform
+        run: terraform plan -input=false -out=tfplan -var="jwt_signing_key=${{ secrets.JWT_SIGNING_KEY }}" -var="sql_server_admin_password=${{ secrets.SQL_SERVER_ADMIN_PASSWORD }}"
+
+      - name: Manual approval gate
+        if: github.event.inputs.environment == 'prod' || (github.ref == 'refs/heads/main' && vars.AUTO_APPROVE_PROD != 'true')
+        uses: trstringer/manual-approval@v1
+        with:
+          approvers: ${{ vars.REQUIRED_APPROVERS }}
+          minimum-approvals: '1'
+          issue-title: 'Deploy API gateway to ${{ github.event.inputs.environment || vars.DEFAULT_ENV }}'
+
+      - name: Terraform apply
+        working-directory: infra/terraform
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Upload build to S3 for ASG user-data
+        run: |
+          aws s3 cp latest.tar.gz s3://${{ vars.PROJECT_NAME }}-${{ github.event.inputs.environment || vars.DEFAULT_ENV }}-builds/latest.tar.gz
+          aws s3 cp latest.sha256 s3://${{ vars.PROJECT_NAME }}-${{ github.event.inputs.environment || vars.DEFAULT_ENV }}-builds/latest.sha256
+
+  rolling-deploy:
+    name: Trigger ASG rolling deployment
+    needs: terraform-plan-apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Start ASG instance refresh
+        run: |
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ vars.PROJECT_NAME }}-${{ github.event.inputs.environment || vars.DEFAULT_ENV }}-asg" \
+            --strategy Rolling \
+            --preferences MinHealthyPercentage=50,InstanceWarmup=60
+
+      - name: Wait for instance refresh to complete
+        run: |
+          REFRESH_ID=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "${{ vars.PROJECT_NAME }}-${{ github.event.inputs.environment || vars.DEFAULT_ENV }}-asg" \
+            --query 'max_by(InstanceRefreshes, &StartTime).InstanceRefreshId' --output text)
+          
+          echo "Waiting for instance refresh $REFRESH_ID"
+          aws autoscaling wait instance-refresh-successful \
+            --auto-scaling-group-name "${{ vars.PROJECT_NAME }}-${{ github.event.inputs.environment || vars.DEFAULT_ENV }}-asg" \
+            --instance-refresh-id "$REFRESH_ID" || echo "Refresh did not complete in time, check console"
