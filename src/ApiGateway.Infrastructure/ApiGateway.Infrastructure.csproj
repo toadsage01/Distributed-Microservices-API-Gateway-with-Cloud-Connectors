@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>ApiGateway.Infrastructure</RootNamespace>
+    <AssemblyName>ApiGateway.Infrastructure</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ApiGateway.Domain\ApiGateway.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
+    <PackageReference Include="AWSSDK.SecretsManager" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\db\migrations\*.sql" Link="Migrations\%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\db\stored-procedures\*.sql" Link="StoredProcedures\%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\db\triggers\*.sql" Link="Triggers\%(Filename)%(Extension)" />
+    <None Include="..\..\db\migrations\*.sql" />
+    <None Include="..\..\db\stored-procedures\*.sql" />
+    <None Include="..\..\db\triggers\*.sql" />
+  </ItemGroup>
+
+</Project>
