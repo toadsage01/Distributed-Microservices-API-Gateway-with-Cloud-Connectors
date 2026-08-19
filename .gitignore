@@ -1,0 +1,53 @@
+# .NET artifacts
+bin/
+obj/
+*.dll
+*.pdb
+*.exe
+*.cache
+*.suo
+*.user
+*.userprefs
+.vs/
+.idea/
+*.DS_Store
+
+# Test results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+
+# Local secrets / appsettings overrides
+appsettings.*.Local.json
+secrets.json
+*.pfx
+*.key
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+
+# JetBrains / VSCode
+.idea/
+.vscode/
+*.swp
+
+# Build output
+artifacts/
+publish/
+out/
